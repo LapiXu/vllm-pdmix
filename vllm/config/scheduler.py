@@ -154,22 +154,6 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
-    enable_pd_separation: bool = False
-    """If True, the scheduler will separate prefill and decode requests
-    into different steps, avoiding PD-mixed batches."""
-
-    pd_scheduling_policy: Literal["prefill_first", "decode_first", "strict_alternation"] = "prefill_first"
-    """The scheduling policy to use when PD separation is enabled:
-    - "prefill_first": prioritize prefill requests over decode requests.
-    - "decode_first": prioritize decode requests over prefill requests.
-    - "strict_alternation": strictly alternate between prefill and decode steps."""
-
-    pd_prefill_inflight_limit: int = Field(default=1, ge=1)
-    """Maximum number of prefill head-segment (PREFILL_FIRST) batches that
-    can be in flight at the same time.  When the limit is reached the
-    scheduler will fall back to decode or emit an empty batch until a
-    corresponding PREFILL_LAST batch completes."""
-
     @staticmethod
     def default_factory(**kwargs):
         """
@@ -183,18 +167,6 @@ class SchedulerConfig:
 
     def get_scheduler_cls(self) -> type["SchedulerInterface"]:
         if self.scheduler_cls is None:
-            if self.enable_pd_separation:
-                if self.async_scheduling:
-                    from vllm.v1.core.sched.pd_separated_scheduler import (
-                        AsyncPDSeparatedScheduler,
-                    )
-
-                    return AsyncPDSeparatedScheduler
-                from vllm.v1.core.sched.pd_separated_scheduler import (
-                    PDSeparatedScheduler,
-                )
-
-                return PDSeparatedScheduler
             if self.async_scheduling:
                 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import enum
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -25,6 +26,25 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+
+
+class HiddenChannelType(enum.Enum):
+    """Data-plane hidden tensor channel for edge-cloud PD separation."""
+    PREFILL_1 = "prefill_1"
+    PREFILL_2 = "prefill_2"
+    DECODE = "decode"
+
+
+class BatchType(enum.Enum):
+    """Composition of a single SchedulerOutput batch."""
+    PD_MIX = "pd_mix"
+    PURE_PREFILL = "pure_prefill"
+    PURE_DECODE = "pure_decode"
+    EMPTY = "empty"
+    PREFILL_FIRST = "prefill_first"
+    PREFILL_LAST = "prefill_last"
+    DECODE_FIRST = "decode_first"
+    DECODE_LAST = "decode_last"
 
 
 @dataclass
@@ -240,6 +260,12 @@ class SchedulerOutput:
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
 
+    # PDMix metadata. The default keeps legacy scheduler outputs classified
+    # as mixed batches unless a PDMix scheduler overrides the fields.
+    batch_type: BatchType = BatchType.PD_MIX
+    head_token: str | None = None
+    hidden_channel: HiddenChannelType | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
@@ -252,6 +278,7 @@ class SchedulerOutput:
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
             free_encoder_mm_hashes=[],
+            batch_type=BatchType.EMPTY,
         )
 
 

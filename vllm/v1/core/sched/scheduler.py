@@ -955,6 +955,19 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        # [EC-DIAG] scheduler-layer batch composition (temporary). CPU-only,
+        # runs in the engine process — no device/HCCL interaction, cannot hang.
+        if len(num_scheduled_tokens) > 1:
+            parts = []
+            for rid, ntok in num_scheduled_tokens.items():
+                req = self.requests.get(rid)
+                nc = req.num_computed_tokens if req is not None else "?"
+                no = req.num_output_tokens if req is not None else "?"
+                spec = len(scheduled_spec_decode_tokens.get(rid, ()))
+                parts.append(f"{rid}: sched={ntok} computed={nc} out={no} spec={spec}")
+            logger.info(f"[EC-DIAG] SCHED total={total_num_scheduled_tokens} "
+                        f"nreqs={len(num_scheduled_tokens)} | " + " || ".join(parts))
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1363,6 +1376,14 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+
+            # [EC-DIAG] per-request generated tokens this step (temporary).
+            # CPU-only in the engine process; safe. Only log multi-req batches.
+            if len(num_scheduled_tokens) > 1:
+                logger.info(
+                    f"[EC-DIAG] GEN req={req_id} idx={req_index} "
+                    f"computed={request.num_computed_tokens} out={request.num_output_tokens} "
+                    f"new_tokens={generated_token_ids}")
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)

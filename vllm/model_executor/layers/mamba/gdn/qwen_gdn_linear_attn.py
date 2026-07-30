@@ -1359,6 +1359,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 1.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
+            # [EDGE-DEBUG] 首次 prefill conv_state 诊断：确认 conv_state 用到的
+            # slot 在 causal_conv1d_fn 调用前是否非零（是否被写脏），以及
+            # has_initial_state / state_indices 实际取值。仅前若干次、且仅 prefill。
+            import os as _os
+            if (_os.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
+                    and getattr(self, "_edge_dbg_n", 0)
+                    < int(_os.environ.get("EDGE_DEBUG_MAX_STEPS", "6"))):
+                self._edge_dbg_n = getattr(self, "_edge_dbg_n", 0) + 1
+                try:
+                    _ci = non_spec_state_indices_tensor
+                    _ci_str = (
+                        str(_ci.flatten()[:8].tolist())
+                        if isinstance(_ci, torch.Tensor) else str(_ci))
+                    _his = has_initial_state
+                    _his_str = (
+                        str(_his.flatten()[:8].tolist())
+                        if isinstance(_his, torch.Tensor) else str(_his))
+                    if isinstance(_ci, torch.Tensor) and _ci.numel() > 0:
+                        _sel = conv_state[_ci.to(torch.int64)]
+                        _cs = (
+                            f"absmax={_sel.float().abs().max().item():.5f} "
+                            f"sum={_sel.float().abs().sum().item():.5f} "
+                            f"allzero={bool((_sel == 0).all().item())}")
+                    else:
+                        _cs = "<no-indices>"
+                    logger.info(
+                        "[EDGE-DEBUG][gdn_prefill] prefix=%s num_prefills=%s "
+                        "num_actual=%s has_initial_state=%s state_indices=%s "
+                        "| conv_state[used_slots] %s",
+                        getattr(self, "prefix", "?"),
+                        attn_metadata.num_prefills, num_actual_tokens,
+                        _his_str, _ci_str, _cs)
+                except Exception as _e:
+                    logger.info("[EDGE-DEBUG][gdn_prefill] <error:%s>", _e)
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"

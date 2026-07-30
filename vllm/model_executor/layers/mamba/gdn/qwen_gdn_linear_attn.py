@@ -82,6 +82,9 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
+# [EDGE-DEBUG] 模块加载标记：确认远程实际加载的是这份工作区文件（而非 site-packages）
+logger.info("[EDGE-DEBUG][gdn_module_loaded] qwen_gdn_linear_attn.py loaded from %s", __file__)
+
 
 # TODO(arpera): remove ``_is_libs_cu13_install_intact`` and its caller in
 # ``_resolve_gdn_prefill_backend`` once the upstream packaging bug is

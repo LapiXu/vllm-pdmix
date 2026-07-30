@@ -963,6 +963,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out,
             layer_name=_encode_layer_name(self.prefix),
         )
+        # [EDGE-DEBUG] forward_cuda 中 custom op 前后：确认 GDN core 是否真正计算
+        # （core_attn_out 由 custom op 原地写入）。放在 custom op 边界之外，
+        # 若图捕获旁路了 op 内部 Python，这里仍可能执行。
+        import os as _os2
+        if (_os2.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
+                and getattr(self, "_edge_dbg_fc_n", 0)
+                < int(_os2.environ.get("EDGE_DEBUG_MAX_STEPS", "6"))
+                and num_tokens > 1):
+            self._edge_dbg_fc_n = getattr(self, "_edge_dbg_fc_n", 0) + 1
+            try:
+                logger.info(
+                    "[EDGE-DEBUG][gdn_fwd_cuda] prefix=%s num_tokens=%s "
+                    "mixed_qkv[absmax=%.5f allzero=%s] "
+                    "core_attn_out[absmax=%.5f allzero=%s]",
+                    getattr(self, "prefix", "?"), num_tokens,
+                    mixed_qkv.float().abs().max().item(),
+                    bool((mixed_qkv == 0).all().item()),
+                    core_attn_out.float().abs().max().item(),
+                    bool((core_attn_out == 0).all().item()))
+            except Exception as _e:
+                logger.info("[EDGE-DEBUG][gdn_fwd_cuda] <error:%s>", _e)
 
         # ============================================================
         # Part 3: Output Projection

@@ -1283,6 +1283,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+        # [EDGE-DEBUG] _forward_core 入口：确认真实请求是否进入、走哪条分支
+        import os as _os
+        if (_os.environ.get("EDGE_DEBUG_FIRST", "0") == "1"
+                and getattr(self, "_edge_dbg_core_n", 0)
+                < int(_os.environ.get("EDGE_DEBUG_MAX_STEPS", "6"))):
+            self._edge_dbg_core_n = getattr(self, "_edge_dbg_core_n", 0) + 1
+            try:
+                logger.info(
+                    "[EDGE-DEBUG][gdn_core_enter] prefix=%s num_prefills=%s "
+                    "num_decodes=%s num_actual=%s spec_masks=%s "
+                    "enable_packed_recurrent_decode=%s",
+                    getattr(self, "prefix", "?"),
+                    attn_metadata.num_prefills, attn_metadata.num_decodes,
+                    attn_metadata.num_actual_tokens,
+                    (attn_metadata.spec_sequence_masks is not None),
+                    getattr(self, "enable_packed_recurrent_decode", "?"))
+            except Exception as _e:
+                logger.info("[EDGE-DEBUG][gdn_core_enter] <error:%s>", _e)
+
         if (
             self.enable_packed_recurrent_decode
             and attn_metadata.spec_sequence_masks is None

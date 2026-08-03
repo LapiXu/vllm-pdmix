@@ -1192,75 +1192,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets,
             )
 
-        # [EDGE-WARMUP] Warm up the decode-path packed_decode kernel.
-        # The packed_decode kernel (NPU Triton) has a cold-launch bug: the
-        # first call after service start returns garbage regardless of
-        # cudagraph or eager mode.  Run a dummy call here during the V1
-        # profile run (when attn_metadata is None) so the first real
-        # request sees a warm kernel.
-        if not getattr(self, "_decode_kernels_warmed_up", False):
-            self._decode_kernels_warmed_up = True
-            self._warmup_decode_kernels(qkv_or_qkvz)
-
         torch.accelerator.empty_cache()
-
-    def _warmup_decode_kernels(self, qkv_or_qkvz: torch.Tensor) -> None:
-        """Warm up the decode-path packed_decode kernel by running a single
-        dummy call with synthetic inputs.  See _warmup_prefill_kernels for
-        why this is needed: the first real inference after service start
-        would otherwise see a cold-launch packed_decode kernel and produce
-        garbled output.
-        """
-        from vllm.model_executor.layers.fla.ops import (
-            fused_recurrent_gated_delta_rule_packed_decode,
-        )
-
-        device = qkv_or_qkvz.device
-        dtype = qkv_or_qkvz.dtype
-        num_k_heads = self.num_k_heads // self.tp_size
-        num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
-        H, K, V = num_k_heads, self.head_k_dim, self.head_v_dim
-        HV = num_v_heads
-
-        T = 1
-        mixed_qkv = torch.randn(
-            T, 2 * H * K + HV * V, device=device, dtype=dtype
-        )
-        a = torch.randn(T, HV, device=device, dtype=dtype)
-        b = torch.randn(T, HV, device=device, dtype=dtype)
-        state = torch.zeros(1, HV, V, K, device=device, dtype=state_dtype)
-        ssm_state_indices = torch.tensor(
-            [1], device=device, dtype=torch.int32
-        )
-        out = torch.empty(T, 1, HV, V, device=device, dtype=dtype)
-
-        try:
-            fused_recurrent_gated_delta_rule_packed_decode(
-                mixed_qkv=mixed_qkv,
-                a=a,
-                b=b,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                scale=K**-0.5,
-                initial_state=state,
-                out=out,
-                ssm_state_indices=ssm_state_indices,
-                use_qk_l2norm_in_kernel=True,
-            )
-            logger.debug(
-                "[EDGE-WARMUP] decode packed_decode warmup completed for layer %s",
-                self.prefix,
-            )
-        except Exception:
-            logger.warning(
-                "[EDGE-WARMUP] decode packed_decode warmup failed for layer %s. "
-                "First inference may produce garbled output.",
-                self.prefix,
-                exc_info=True,
-            )
-        finally:
-            del mixed_qkv, a, b, state, ssm_state_indices, out
 
     def _forward_core_rocm(
         self,
@@ -1749,6 +1681,46 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             validate_data=False,
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
+        # [EDGE-DEBUG] decode 路径 packed_decode 前后诊断
+        # 因 enable_decode_graph=false, decode 走 eager, Python 端诊断有效
+        # 用来定位 n=1 vs n=2 的输入/输出差异
+        import logging as _dec_log
+        _dec_diag = _dec_log.getLogger("vllm_ascend.diag")
+        try:
+            _idx = non_spec_state_indices_tensor[:num_actual_tokens]
+            _idx_host = (
+                _idx.flatten()[:8].tolist()
+                if hasattr(_idx, "flatten") else list(_idx)[:8]
+            )
+            # ssm_state[state_idx] 的统计
+            if len(_idx_host) > 0 and _idx_host[0] > 0:
+                _sel = ssm_state[_idx_host[0]]
+                _ss = (
+                    f"ssm_state[idx0]_sum={_sel.float().sum().item():.4f} "
+                    f"ssm_state[idx0]_absmax={_sel.float().abs().max().item():.4f} "
+                    f"finite={bool(torch.isfinite(_sel).all().item())}"
+                )
+            else:
+                _ss = "<no-valid-idx>"
+            _dec_diag.warning(
+                "[EDGE-DEBUG][gdn_before_packed_decode] layer=%s "
+                "num_actual_tokens=%d state_indices[:8]=%s "
+                "mixed_qkv_non_spec[sum=%.4f absmax=%.4f] "
+                "a[sum=%.4f absmax=%.4f] b[sum=%.4f absmax=%.4f] %s",
+                self.prefix, num_actual_tokens, _idx_host,
+                mixed_qkv_non_spec.float().sum().item(),
+                mixed_qkv_non_spec.float().abs().max().item(),
+                a.float().sum().item(),
+                a.float().abs().max().item(),
+                b.float().sum().item(),
+                b.float().abs().max().item(),
+                _ss,
+            )
+        except Exception as _e:
+            _dec_diag.warning(
+                "[EDGE-DEBUG][gdn_before_packed_decode] <error:%s>", _e
+            )
+
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
@@ -1761,6 +1733,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
+
+        # [EDGE-DEBUG] packed_decode 输出后诊断
+        try:
+            _dec_diag.warning(
+                "[EDGE-DEBUG][gdn_after_packed_decode] layer=%s "
+                "out_buf[sum=%.4f absmax=%.4f finite=%s] "
+                "ssm_state_after[sum=%.4f absmax=%.4f finite=%s]",
+                self.prefix,
+                out_buf.float().sum().item(),
+                out_buf.float().abs().max().item(),
+                bool(torch.isfinite(out_buf).all().item()),
+                ssm_state[_idx_host[0]].float().sum().item()
+                if _idx_host and _idx_host[0] > 0 else 0.0,
+                ssm_state[_idx_host[0]].float().abs().max().item()
+                if _idx_host and _idx_host[0] > 0 else 0.0,
+                bool(torch.isfinite(ssm_state[_idx_host[0]]).all().item())
+                if _idx_host and _idx_host[0] > 0 else False,
+            )
+        except Exception as _e:
+            _dec_diag.warning(
+                "[EDGE-DEBUG][gdn_after_packed_decode] <error:%s>", _e
+            )
         return
 
 

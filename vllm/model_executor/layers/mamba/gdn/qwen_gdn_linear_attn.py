@@ -1147,34 +1147,38 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
 
+        # [EDGE-WARMUP-PREFILL] 方案 N: 多次 warmup 解决 TP1 算子 cold-start 同步问题.
+        # n=1 PREFILL 阶段 KKT/solve_tril/wy_fast 在 TP1 上首次 launch 行为异常
+        # (与 TP0 差 3-13%), 导致 final_state 不准 → ssm_state 写回错误 →
+        # DECODE 阶段读错 ssm_state → token 乱码. 多次 warmup 让 TP1 cold-start
+        # 完全消失, 真实请求走稳态路径.
         try:
-            self.chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-            )
-        except Exception:
-            logger.warning(
-                "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
-                T,
-                self.prefix,
-                exc_info=True,
-            )
-        else:
+            _NUM_PREFILL_WARMUPS = 3
+            _warmup_successes = 0
+            for _warm_i in range(_NUM_PREFILL_WARMUPS):
+                try:
+                    self.chunk_gated_delta_rule(
+                        q=q,
+                        k=k,
+                        v=v,
+                        g=g,
+                        beta=beta,
+                        initial_state=state,
+                        output_final_state=True,
+                        cu_seqlens=cu_seqlens,
+                        chunk_indices=chunk_indices,
+                        chunk_offsets=chunk_offsets,
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                    _warmup_successes += 1
+                except Exception as _warm_e:
+                    logger.debug(
+                        "[EDGE-WARMUP-PREFILL] layer=%s warmup[%d/%d] failed: %s",
+                        self.prefix, _warm_i + 1, _NUM_PREFILL_WARMUPS, _warm_e,
+                    )
             logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                T,
-                self.prefix,
+                "[EDGE-WARMUP-PREFILL] layer=%s completed %d/%d prefill warmups",
+                self.prefix, _warmup_successes, _NUM_PREFILL_WARMUPS,
             )
         finally:
             del (

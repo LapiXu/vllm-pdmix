@@ -1192,7 +1192,75 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 chunk_offsets,
             )
 
+        # [EDGE-WARMUP] Warm up the decode-path packed_decode kernel.
+        # The packed_decode kernel (NPU Triton) has a cold-launch bug: the
+        # first call after service start returns garbage regardless of
+        # cudagraph or eager mode.  Run a dummy call here during the V1
+        # profile run (when attn_metadata is None) so the first real
+        # request sees a warm kernel.
+        if not getattr(self, "_decode_kernels_warmed_up", False):
+            self._decode_kernels_warmed_up = True
+            self._warmup_decode_kernels(qkv_or_qkvz)
+
         torch.accelerator.empty_cache()
+
+    def _warmup_decode_kernels(self, qkv_or_qkvz: torch.Tensor) -> None:
+        """Warm up the decode-path packed_decode kernel by running a single
+        dummy call with synthetic inputs.  See _warmup_prefill_kernels for
+        why this is needed: the first real inference after service start
+        would otherwise see a cold-launch packed_decode kernel and produce
+        garbled output.
+        """
+        from vllm.model_executor.layers.fla.ops import (
+            fused_recurrent_gated_delta_rule_packed_decode,
+        )
+
+        device = qkv_or_qkvz.device
+        dtype = qkv_or_qkvz.dtype
+        num_k_heads = self.num_k_heads // self.tp_size
+        num_v_heads = self.num_v_heads // self.tp_size
+        _, state_dtype = self.get_state_dtype()
+        H, K, V = num_k_heads, self.head_k_dim, self.head_v_dim
+        HV = num_v_heads
+
+        T = 1
+        mixed_qkv = torch.randn(
+            T, 2 * H * K + HV * V, device=device, dtype=dtype
+        )
+        a = torch.randn(T, HV, device=device, dtype=dtype)
+        b = torch.randn(T, HV, device=device, dtype=dtype)
+        state = torch.zeros(1, HV, V, K, device=device, dtype=state_dtype)
+        ssm_state_indices = torch.tensor(
+            [1], device=device, dtype=torch.int32
+        )
+        out = torch.empty(T, 1, HV, V, device=device, dtype=dtype)
+
+        try:
+            fused_recurrent_gated_delta_rule_packed_decode(
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                scale=K**-0.5,
+                initial_state=state,
+                out=out,
+                ssm_state_indices=ssm_state_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            logger.debug(
+                "[EDGE-WARMUP] decode packed_decode warmup completed for layer %s",
+                self.prefix,
+            )
+        except Exception:
+            logger.warning(
+                "[EDGE-WARMUP] decode packed_decode warmup failed for layer %s. "
+                "First inference may produce garbled output.",
+                self.prefix,
+                exc_info=True,
+            )
+        finally:
+            del mixed_qkv, a, b, state, ssm_state_indices, out
 
     def _forward_core_rocm(
         self,
